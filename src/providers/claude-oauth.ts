@@ -416,6 +416,41 @@ function extractTextFromAnthropicResponse(data: unknown): string {
   return "";
 }
 
+function normalizeAnthropicToolArgs(input: unknown): string {
+  if (typeof input === "string") return input;
+  try {
+    return JSON.stringify(input ?? {});
+  } catch {
+    return "{}";
+  }
+}
+
+export function extractToolCallsFromAnthropicResponse(data: unknown): Record<string, unknown>[] | null {
+  if (typeof data !== "object" || data === null) return null;
+  const obj = data as Record<string, unknown>;
+  const content = obj.content;
+  if (!Array.isArray(content)) return null;
+
+  const toolCalls: Record<string, unknown>[] = [];
+  for (const item of content) {
+    if (typeof item !== "object" || item === null) continue;
+    const block = item as Record<string, unknown>;
+    if (block.type !== "tool_use") continue;
+    const id = typeof block.id === "string" && block.id ? block.id : `call_${toolCalls.length + 1}`;
+    const name = typeof block.name === "string" && block.name ? block.name : "tool";
+    toolCalls.push({
+      id,
+      type: "function",
+      function: {
+        name,
+        arguments: normalizeAnthropicToolArgs(block.input),
+      },
+    });
+  }
+
+  return toolCalls.length > 0 ? toolCalls : null;
+}
+
 function extractUsageFromAnthropicResponse(data: unknown): Record<string, number> | null {
   if (typeof data !== "object" || data === null) return null;
   const obj = data as Record<string, unknown>;
@@ -470,7 +505,7 @@ function extractStreamUsage(obj: unknown): Record<string, number> | null {
 export async function generateOauth(
   req: ChatCompletionRequest,
   modelName: string
-): Promise<[string, Record<string, number> | null]> {
+): Promise<[string, Record<string, number> | null, Record<string, unknown>[] | null]> {
   const cliConfig = getClaudeCliConfig();
   let authToken: string;
   let baseUrl: string;
@@ -526,6 +561,7 @@ export async function generateOauth(
   return [
     extractTextFromAnthropicResponse(data),
     extractUsageFromAnthropicResponse(data),
+    extractToolCallsFromAnthropicResponse(data),
   ];
 }
 
@@ -636,10 +672,42 @@ export async function* iterOauthStreamEvents(
   if (!body) throw new Error("No response body");
 
   let usage: Record<string, number> | null = null;
+  const toolCallsByIndex = new Map<number, { id: string; name: string; arguments: string }>();
   for await (const [, data] of iterSseEvents(body)) {
     if (!data || data.trim() === "[DONE]") continue;
     try {
       const obj = JSON.parse(data) as unknown;
+      if (typeof obj === "object" && obj !== null) {
+        const eventObj = obj as Record<string, unknown>;
+        const eventType = eventObj.type;
+        const index = typeof eventObj.index === "number" ? eventObj.index : null;
+        if (eventType === "content_block_start" && index !== null) {
+          const block = eventObj.content_block;
+          if (typeof block === "object" && block !== null) {
+            const contentBlock = block as Record<string, unknown>;
+            if (contentBlock.type === "tool_use") {
+              const id =
+                typeof contentBlock.id === "string" && contentBlock.id
+                  ? contentBlock.id
+                  : `call_${toolCallsByIndex.size + 1}`;
+              const name =
+                typeof contentBlock.name === "string" && contentBlock.name
+                  ? contentBlock.name
+                  : "tool";
+              toolCallsByIndex.set(index, { id, name, arguments: normalizeAnthropicToolArgs(contentBlock.input) });
+            }
+          }
+        } else if (eventType === "content_block_delta" && index !== null) {
+          const deltaObj = eventObj.delta;
+          const current = toolCallsByIndex.get(index);
+          if (current && typeof deltaObj === "object" && deltaObj !== null) {
+            const delta = deltaObj as Record<string, unknown>;
+            if (delta.type === "input_json_delta" && typeof delta.partial_json === "string") {
+              current.arguments += delta.partial_json;
+            }
+          }
+        }
+      }
       const delta = extractDeltaText(obj);
       if (delta) {
         yield {
@@ -654,13 +722,22 @@ export async function* iterOauthStreamEvents(
     }
   }
 
-  if (usage) {
+  const toolCalls = Array.from(toolCallsByIndex.values()).map((call) => ({
+    id: call.id,
+    type: "function",
+    function: {
+      name: call.name,
+      arguments: call.arguments || "{}",
+    },
+  }));
+  if (usage || toolCalls.length > 0) {
     yield {
       type: "result",
       usage: {
-        input_tokens: usage.prompt_tokens,
-        output_tokens: usage.completion_tokens,
+        input_tokens: usage?.prompt_tokens ?? 0,
+        output_tokens: usage?.completion_tokens ?? 0,
       },
+      ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
     };
   }
 }

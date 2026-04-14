@@ -59,6 +59,75 @@ export type ErrorResponse = z.infer<typeof ErrorResponseSchema>;
 export type ChatCompletionRequestCompat = z.infer<typeof ChatCompletionRequestCompatSchema>;
 export type ResponsesRequest = z.infer<typeof ResponsesRequestSchema>;
 
+type LooseRecord = Record<string, unknown>;
+
+function copyMissingToolingFields(target: LooseRecord, source: LooseRecord, keys: string[]): boolean {
+  let changed = false;
+  for (const key of keys) {
+    if (source[key] !== undefined && target[key] === undefined) {
+      target[key] = source[key];
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+function normalizeToolingMessage(message: ChatMessage): ChatMessage {
+  const raw = message as LooseRecord;
+  const extraRaw = raw.model_extra;
+  const extra: LooseRecord =
+    typeof extraRaw === "object" && extraRaw !== null && !Array.isArray(extraRaw)
+      ? { ...(extraRaw as LooseRecord) }
+      : {};
+
+  let changed = false;
+
+  if (message.role === "assistant") {
+    changed =
+      copyMissingToolingFields(extra, raw, ["tool_calls", "function_call"]) || changed;
+  } else if (message.role === "tool") {
+    changed = copyMissingToolingFields(extra, raw, ["tool_call_id", "call_id"]) || changed;
+  }
+
+  if (!changed) return message;
+  return { ...raw, model_extra: extra } as unknown as ChatMessage;
+}
+
+/**
+ * Mirror top-level OpenAI tool-call fields into model_extra for providers that
+ * currently read internal tooling config from model_extra while preserving
+ * existing model_extra callers as the source of truth.
+ */
+export function normalizeToolingRequest(req: ChatCompletionRequest): ChatCompletionRequest {
+  const raw = req as LooseRecord;
+  const extraRaw = raw.model_extra;
+  const extra: LooseRecord =
+    typeof extraRaw === "object" && extraRaw !== null && !Array.isArray(extraRaw)
+      ? { ...(extraRaw as LooseRecord) }
+      : {};
+
+  const requestExtraChanged = copyMissingToolingFields(extra, raw, [
+    "tools",
+    "tool_choice",
+    "parallel_tool_calls",
+  ]);
+
+  let messageChanged = false;
+  const messages = req.messages.map((message) => {
+    const normalized = normalizeToolingMessage(message);
+    if (normalized !== message) messageChanged = true;
+    return normalized;
+  });
+
+  if (!requestExtraChanged && !messageChanged) return req;
+
+  const next: LooseRecord = { ...raw, messages };
+  if (requestExtraChanged || raw.model_extra !== undefined) {
+    next.model_extra = extra;
+  }
+  return next as ChatCompletionRequest;
+}
+
 // --- Helper: coerce Responses API part ---
 function _coerceResponsesPart(part: Record<string, unknown>): Record<string, unknown> | null {
   const partType = part.type;
@@ -175,13 +244,13 @@ export function responsesRequestToChatRequest(req: ResponsesRequest): ChatComple
     maxTokens = (extra as Record<string, unknown>).max_tokens as number;
   }
 
-  return {
+  return normalizeToolingRequest({
     ...extra,
     model: req.model ?? null,
     messages,
     stream: req.stream ?? false,
     max_tokens: maxTokens ?? null,
-  } as ChatCompletionRequest;
+  } as ChatCompletionRequest);
 }
 
 /** Normalize compat request to standard ChatCompletionRequest. */
@@ -189,7 +258,7 @@ export function compatChatRequestToChatRequest(
   req: ChatCompletionRequest | ChatCompletionRequestCompat
 ): ChatCompletionRequest {
   if ("messages" in req && Array.isArray(req.messages) && req.messages.length > 0) {
-    return req as ChatCompletionRequest;
+    return normalizeToolingRequest(req as ChatCompletionRequest);
   }
 
   const compat = req as ChatCompletionRequestCompat;
@@ -220,13 +289,13 @@ export function compatChatRequestToChatRequest(
     maxTokens = (extra as Record<string, unknown>).max_tokens as number;
   }
 
-  return {
+  return normalizeToolingRequest({
     ...extra,
     model: compat.model ?? null,
     messages,
     stream: compat.stream ?? false,
     max_tokens: maxTokens ?? null,
-  } as ChatCompletionRequest;
+  } as ChatCompletionRequest);
 }
 
 /** Extract text from various content formats. */

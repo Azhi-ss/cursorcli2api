@@ -188,6 +188,19 @@ function maybeStripAnswerTags(text: string): string {
   return text;
 }
 
+function ensureWorkspaceDir(dirPath: string | null | undefined): void {
+  const resolved = (dirPath ?? "").trim();
+  if (!resolved) return;
+  if (existsSync(resolved)) {
+    const stat = statSync(resolved);
+    if (!stat.isDirectory()) {
+      throw new Error(`Workspace path is not a directory: ${resolved}`);
+    }
+    return;
+  }
+  mkdirSync(resolved, { recursive: true });
+}
+
 function openaiError(message: string, statusCode = 500): Response {
   return new Response(
     JSON.stringify({
@@ -961,6 +974,7 @@ async function handleChatCompletions(
         } else if (provider === "cursor-agent") {
           const cursorModel = effectiveProviderModel ?? settings.cursor_agent_model ?? "auto";
           const cursorWorkspace = settings.cursor_agent_workspace ?? settings.workspace;
+          ensureWorkspaceDir(cursorWorkspace);
           const cmd = [
             settings.cursor_agent_bin,
             "-p",
@@ -1005,9 +1019,10 @@ async function handleChatCompletions(
               ...req,
               messages: msgs,
             };
-            const [t, u] = await claudeOauthGenerate(req2, claudeModel);
+            const [t, u, tc] = await claudeOauthGenerate(req2, claudeModel);
             text = t;
             usage = u;
+            toolCalls = tc;
           } else {
             const cmd = [
               settings.claude_bin,
@@ -1211,6 +1226,7 @@ async function handleChatCompletions(
               } else if (provider === "cursor-agent") {
                 const cursorModel = effectiveProviderModel ?? settings.cursor_agent_model ?? "auto";
                 const cursorWorkspace = settings.cursor_agent_workspace ?? settings.workspace;
+                ensureWorkspaceDir(cursorWorkspace);
                 const cmd = [
                   settings.cursor_agent_bin,
                   "-p",
@@ -1387,6 +1403,9 @@ async function handleChatCompletions(
                   delta = maybeStripAnswerTags(extractCursorAgentDelta(evt, assembler));
                 } else if (provider === "claude") {
                   delta = maybeStripAnswerTags(extractClaudeDelta(evt, assembler));
+                  if (evt.type === "result" && Array.isArray(evt.tool_calls) && evt.tool_calls.length > 0) {
+                    streamToolCalls = evt.tool_calls as Record<string, unknown>[];
+                  }
                 } else if (provider === "gemini") {
                   delta = maybeStripAnswerTags(extractGeminiDelta(evt, assembler));
                 }

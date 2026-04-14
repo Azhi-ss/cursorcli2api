@@ -7,6 +7,7 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { program } from "commander";
+import type { Socket } from "node:net";
 
 function normalizeProvider(raw: string | undefined): string | null {
   if (!raw) return null;
@@ -205,6 +206,26 @@ async function main(): Promise<void> {
 
   await onStartup();
   const server = serve({ fetch: app.fetch, port, hostname: host });
+
+  const benignSocketErrorCodes = new Set(["EPIPE", "ECONNRESET"]);
+  const attachSocketGuards = (socket: Socket) => {
+    socket.on("error", (err: NodeJS.ErrnoException) => {
+      if (err?.code && benignSocketErrorCodes.has(err.code)) {
+        console.error(`[agent-cli-to-api] ignored socket ${err.code} from disconnected client`);
+        return;
+      }
+      console.error("[agent-cli-to-api] socket error:", err);
+    });
+  };
+
+  server.on("connection", attachSocketGuards);
+  server.on("clientError", (err: NodeJS.ErrnoException) => {
+    if (err?.code && benignSocketErrorCodes.has(err.code)) {
+      console.error(`[agent-cli-to-api] ignored clientError ${err.code}`);
+      return;
+    }
+    console.error("[agent-cli-to-api] clientError:", err);
+  });
 
   process.on("SIGTERM", async () => {
     await onShutdown();

@@ -11,6 +11,7 @@
     "start": "node dist/cli.js cursor-agent --host 0.0.0.0",
     "dev": "tsx src/cli.ts",
     "build": "tsc && cp -r src/codex_instructions dist/",
+    "test": "node --import tsx --test tests/**/*.test.ts",
     "typecheck": "tsc --noEmit",
     "doctor": "tsx src/cli.ts doctor"
   },
